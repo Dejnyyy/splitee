@@ -1,30 +1,11 @@
 import { ConvexError, v } from "convex/values";
 import { mutation, query } from "./_generated/server";
-import type { QueryCtx } from "./_generated/server";
-import type { Doc, Id } from "./_generated/dataModel";
-import { requireMembership } from "./guards";
+import type { Id } from "./_generated/dataModel";
+import { requireUser, requireMembership } from "./guards";
+import { memberLookup } from "./members";
 import { aggregateDebts } from "./lib/debts";
 import { ERROR } from "../lib/errors";
-
-/** Přezdívka a barva (klíč z lib/colors.ts, ne hex) každého člena party, pro popisky u dluhů/historie. */
-async function memberLookup(ctx: QueryCtx, groupId: Id<"groups">) {
-  const memberships = await ctx.db
-    .query("memberships")
-    .withIndex("by_group", (q) => q.eq("groupId", groupId))
-    .collect();
-
-  const entries = await Promise.all(
-    memberships.map(async (m) => {
-      const user = await ctx.db.get(m.userId);
-      return [
-        m.userId as string,
-        { nickname: user?.nickname ?? user?.name ?? "Někdo", color: m.color },
-      ] as const;
-    }),
-  );
-
-  return new Map(entries);
-}
+import { UNKNOWN_MEMBER_COLOR } from "../lib/colors";
 
 /**
  * „Kdo komu kolik dluží" — vždy z konkrétních nevyrovnaných podílů (nikdy z
@@ -33,6 +14,16 @@ async function memberLookup(ctx: QueryCtx, groupId: Id<"groups">) {
  * období pořád zakládá reálný dluh, dluh nevyprší tím, že se přehoupne měsíc.
  * `fromColor`/`toColor` jsou klíče z lib/colors.ts (`membership.color`), ne
  * hexy — zobrazovací vrstva si přes ně hex dohledá přes `colorByKey()`.
+ * Chybějící člen (dnes nedosažitelné, appka nemá odchod z party) dostane
+ * `UNKNOWN_MEMBER_COLOR`, ne barvu skutečného člena — ta je identita, ne
+ * dekorace, a `colorByKey()` na ní schválně spadne, aby si ji zobrazovací
+ * vrstva musela ošetřit zvlášť.
+ * `splitIds` nese id všech nevyrovnaných podílů mezi dvojicí `from`/`to`
+ * (v obou směrech, přesně to, co `aggregateDebts` sečetlo do `amount`) —
+ * bez nich by tahle karta nebyla dohledatelná ke konkrétním výdajům a Task
+ * 10 by pro vyrovnání jednotlivého podílu musela sahat znovu do
+ * period-filtrovaného `expenses.listForGroup`, kde by starší dluh vůbec
+ * nemusel být vidět.
  */
 export const debts = query({
   args: { groupId: v.id("groups") },
@@ -46,6 +37,21 @@ export const debts = query({
 
     const members = await memberLookup(ctx, groupId);
 
+    // Id podílů podle neuspořádané dvojice lidí — `aggregateDebts` netuje
+    // oba směry do jednoho řádku, takže i tahle mapa musí sdružovat oba
+    // směry pod stejný klíč, jinak by `splitIds` u výsledné karty pokrylo
+    // jen polovinu toho, co `amount` ve skutečnosti sečetlo.
+    const splitIdsByPair = new Map<string, Id<"splits">[]>();
+    for (const s of unsettled) {
+      const debtor = s.userId as string;
+      const creditor = s.payerId as string;
+      if (debtor === creditor) continue; // plátcův vlastní podíl nikdy není settled: false, ale pro jistotu
+      const key = [debtor, creditor].sort().join("|");
+      const list = splitIdsByPair.get(key);
+      if (list) list.push(s._id);
+      else splitIdsByPair.set(key, [s._id]);
+    }
+
     return aggregateDebts(
       unsettled.map((s) => ({
         debtorId: s.userId as string,
@@ -56,10 +62,11 @@ export const debts = query({
       from: debt.from as Id<"users">,
       to: debt.to as Id<"users">,
       amount: debt.amount,
+      splitIds: splitIdsByPair.get([debt.from, debt.to].sort().join("|")) ?? [],
       fromNickname: members.get(debt.from)?.nickname ?? "Někdo",
-      fromColor: members.get(debt.from)?.color ?? "red",
+      fromColor: members.get(debt.from)?.color ?? UNKNOWN_MEMBER_COLOR,
       toNickname: members.get(debt.to)?.nickname ?? "Někdo",
-      toColor: members.get(debt.to)?.color ?? "red",
+      toColor: members.get(debt.to)?.color ?? UNKNOWN_MEMBER_COLOR,
     }));
   },
 });
@@ -78,10 +85,15 @@ export const debts = query({
 export const settleSplit = mutation({
   args: { splitId: v.id("splits") },
   handler: async (ctx, { splitId }) => {
+    // requireUser dřív než čtení podílu — jinak by SPLIT_NOT_FOUND (na
+    // neexistujícím id) vs. DEBT_NOT_YOURS/úspěch (na reálném) fungovalo
+    // jako oracle na existenci id i bez přihlášení (stejný důvod jako u
+    // expenses.update, convex/expenses.ts:236).
+    const userId = await requireUser(ctx);
     const split = await ctx.db.get(splitId);
     if (split === null) throw new ConvexError({ code: ERROR.SPLIT_NOT_FOUND });
+    await requireMembership(ctx, split.groupId);
 
-    const { userId } = await requireMembership(ctx, split.groupId);
     if (userId !== split.userId && userId !== split.payerId) {
       throw new ConvexError({ code: ERROR.DEBT_NOT_YOURS });
     }
@@ -104,14 +116,20 @@ export const settleSplit = mutation({
  *    s nenulovým rozdílem) — zrušit ho jednotlivě by nechalo `settlements`
  *    řádek nesedět na to, co je/není vyrovnané. Takový podíl se ruší jen
  *    celý, přes `unsettleSettlement`.
+ *
+ * Podíl vyrovnaný přes `settleAllWith` s NULOVÝM rozdílem `settlementId`
+ * nemá (viz komentář u `settleAllWith`) — ten se tady chová stejně jako
+ * kterýkoli jiný osamocený `settleSplit` a jde vrátit zpátky bez omezení.
  */
 export const unsettleSplit = mutation({
   args: { splitId: v.id("splits") },
   handler: async (ctx, { splitId }) => {
+    // requireUser dřív než čtení podílu — stejný důvod jako u settleSplit výš.
+    const userId = await requireUser(ctx);
     const split = await ctx.db.get(splitId);
     if (split === null) throw new ConvexError({ code: ERROR.SPLIT_NOT_FOUND });
+    await requireMembership(ctx, split.groupId);
 
-    const { userId } = await requireMembership(ctx, split.groupId);
     if (userId !== split.userId && userId !== split.payerId) {
       throw new ConvexError({ code: ERROR.DEBT_NOT_YOURS });
     }
@@ -137,13 +155,19 @@ export const unsettleSplit = mutation({
  *  - Rozdíl přesně nula (oba dluží stejně) → všechny podíly se označí za
  *    vyrovnané, ale `settlements` řádek nevzniká (nic reálně nepřešlo z
  *    ruky do ruky) — přesně tenhle případ dokumentuje komentář u
- *    `deleteSplits` v convex/expenses.ts.
+ *    `deleteSplits` v convex/expenses.ts. Takové podíly nenesou
+ *    `settlementId` (nemají co), takže se dají zvlášť vrátit přes
+ *    `unsettleSplit` — jen ne naráz jedním voláním, protože spolu nesdílí
+ *    žádný společný záznam.
  *  - Nenulový rozdíl → jeden `settlements` řádek s čistou částkou a směrem,
  *    všechny zahrnuté podíly dostanou jeho `settlementId`.
  *
  * Oprávnění: volající smí vyrovnávat jen svoje vlastní dluhy vůči
  * `otherUserId` — `userId` je vždy identita volajícího z `requireMembership`,
- * nejde vyrovnat dluhy mezi dvěma jinými lidmi za ně.
+ * nejde vyrovnat dluhy mezi dvěma jinými lidmi za ně. Funguje shodně bez
+ * ohledu na to, jestli volající je v páru dlužník nebo věřitel — směr
+ * výsledného `settlements` řádku určuje jen `aggregateDebts`, ne to, kdo
+ * mutaci zavolal.
  */
 export const settleAllWith = mutation({
   args: { groupId: v.id("groups"), otherUserId: v.id("users") },
@@ -172,7 +196,7 @@ export const settleAllWith = mutation({
 
     if (net.length === 0) {
       // po vyrušení nikdo nikomu nic nedluží — jen zavřeme podíly, žádný
-      // settlements řádek (money never changed hands)
+      // settlements řádek (peníze reálně nikam nepřešly)
       await Promise.all(between.map((s) => ctx.db.patch(s._id, { settled: true, settledAt: now })));
       return null;
     }
@@ -197,10 +221,11 @@ export const settleAllWith = mutation({
 
 /**
  * Zruší hromadné vyrovnání založené `settleAllWith` s nenulovým rozdílem:
- * u každého podílu, který na sobě nese jeho `settlementId`, vrátí
- * `settled`/`settledAt`/`settlementId` zpátky na výchozí stav, a smaže
- * samotný `settlements` řádek (žádná jiná tabulka na jeho `_id` neukazuje,
- * takže po zrušení vyrovnání nemá co evidovat).
+ * u každého podílu, který na sobě nese jeho `settlementId` (dohledá přes
+ * `by_settlementId`, ne skenem celé party), vrátí `settled`/`settledAt`/
+ * `settlementId` zpátky na výchozí stav, a smaže samotný `settlements`
+ * řádek (žádná jiná tabulka na jeho `_id` neukazuje, takže po zrušení
+ * vyrovnání nemá co evidovat).
  *
  * Oprávnění: jen jedna ze dvou stran vyrovnání (`fromUserId`/`toUserId`) —
  * stejné pravidlo jako u `settleSplit`/`unsettleSplit`, přenesené na
@@ -209,22 +234,20 @@ export const settleAllWith = mutation({
 export const unsettleSettlement = mutation({
   args: { settlementId: v.id("settlements") },
   handler: async (ctx, { settlementId }) => {
+    // requireUser dřív než čtení vyrovnání — stejný důvod jako u settleSplit.
+    const userId = await requireUser(ctx);
     const settlement = await ctx.db.get(settlementId);
     if (settlement === null) throw new ConvexError({ code: ERROR.SETTLEMENT_NOT_FOUND });
+    await requireMembership(ctx, settlement.groupId);
 
-    const { userId } = await requireMembership(ctx, settlement.groupId);
     if (userId !== settlement.fromUserId && userId !== settlement.toUserId) {
       throw new ConvexError({ code: ERROR.DEBT_NOT_YOURS });
     }
 
-    // settlementId není indexované samostatně — v malé partě (nejvýš deset
-    // lidí) je filtr v paměti nad "settled" podíly té party levný a
-    // nepřidává další dotaz navíc (stejný přístup jako `between` filtr výš).
-    const settled = await ctx.db
+    const covered = await ctx.db
       .query("splits")
-      .withIndex("by_group_settled", (q) => q.eq("groupId", settlement.groupId).eq("settled", true))
+      .withIndex("by_settlementId", (q) => q.eq("settlementId", settlementId))
       .collect();
-    const covered = settled.filter((s) => s.settlementId === settlementId);
 
     await Promise.all(
       covered.map((s) =>
@@ -249,7 +272,7 @@ export const listForGroup = query({
       .collect();
 
     const members = await memberLookup(ctx, groupId);
-    return rows.map((s: Doc<"settlements">) => ({
+    return rows.map((s) => ({
       ...s,
       fromNickname: members.get(s.fromUserId)?.nickname ?? "Někdo",
       toNickname: members.get(s.toUserId)?.nickname ?? "Někdo",
