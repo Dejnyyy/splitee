@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { MEMBER_COLORS, colorByKey, firstFreeColor } from "./colors";
+import { MEMBER_COLORS, UNKNOWN_MEMBER_COLOR, colorByKey, firstFreeColor } from "./colors";
 
 describe("MEMBER_COLORS", () => {
   it("má dvanáct barev, aby vystačily i na plnou partu", () => {
@@ -17,6 +17,14 @@ describe("MEMBER_COLORS", () => {
 
   it("u každé barvy říká, jestli na ní má být černý nebo bílý text", () => {
     for (const c of MEMBER_COLORS) expect(["black", "white"]).toContain(c.textOn);
+  });
+
+  // Task 7, review round 1: UNKNOWN_MEMBER_COLOR (convex/settlements.ts's
+  // debts fallback pro chybějícího člena) musí zůstat MIMO paletu — kdyby
+  // sem někdy přibyla barva s klíčem "unknown", ticše by obnovila kolizi,
+  // které se sentinel měl vyhnout.
+  it("neobsahuje klíč vyhrazený pro UNKNOWN_MEMBER_COLOR", () => {
+    expect(MEMBER_COLORS.map((c) => c.key)).not.toContain(UNKNOWN_MEMBER_COLOR);
   });
 });
 

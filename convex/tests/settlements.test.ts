@@ -91,7 +91,7 @@ test("nečlen podíl nevyrovná", async () => {
 });
 
 test("vzájemné dluhy se vyruší na jednu kartu", async () => {
-  const { groupId, dejny, petr, categoryId } = await pizzaZaStovku();
+  const { t, groupId, dejny, petr, categoryId } = await pizzaZaStovku();
 
   // Petr zaplatí 40 Kč za oba → Dejny mu dluží 20, proti tomu Petr dluží 50
   await petr.asUser.mutation(api.expenses.create, {
@@ -105,9 +105,18 @@ test("vzájemné dluhy se vyruší na jednu kartu", async () => {
     participants: [{ userId: dejny.userId }, { userId: petr.userId }],
   });
 
+  // oba směry: petrův podíl z pizzy (petr dluží dejnymu) i dejnyho podíl z kafe (dejny dluží petrovi)
+  const pizzaSplitId = await petrovSplitId(t, groupId, petr.userId);
+  const kafeSplitId = await petrovSplitId(t, groupId, dejny.userId);
+
   const debts = await dejny.asUser.query(api.settlements.debts, { groupId });
   expect(debts).toHaveLength(1);
   expect(debts[0]).toMatchObject({ from: petr.userId, to: dejny.userId, amount: 3000 });
+  // Review round 2, Finding 1: splitIds musí pokrýt OBA směry netted dvojice,
+  // ne jen ten, co souhlasí se směrem výsledné karty (petr→dejny) — s
+  // uspořádaným párovým klíčem (jen debtor===from && creditor===to) by tu
+  // chyběl kafeSplitId a tenhle test by spadl.
+  expect(debts[0].splitIds.slice().sort()).toEqual([kafeSplitId, pizzaSplitId].sort());
 });
 
 test("vyrovnat vše označí podíly v obou směrech a založí jeden záznam", async () => {
